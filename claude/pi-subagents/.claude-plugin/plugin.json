@@ -1,0 +1,8 @@
+{
+  "name": "pi-subagents",
+  "version": "0.1.0",
+  "description": "Lets Claude spawn pi subagents on the Codex account pool (codex-pool), which switches ChatGPT accounts automatically.",
+  "author": {
+    "name": "Vinayak1337"
+  }
+}

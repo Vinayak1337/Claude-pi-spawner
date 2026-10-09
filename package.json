@@ -1,0 +1,12 @@
+{
+  "name": "claude-pi-spawner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code spawns pi subagents on a pool of ChatGPT/Codex accounts that switches accounts automatically.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-timeout=90000 pi/codex-accounts/test.mjs",
+    "validate": "claude plugin validate claude/pi-subagents"
+  }
+}
