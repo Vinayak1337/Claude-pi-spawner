@@ -8,6 +8,7 @@ import { once } from "node:events";
 import { execFile, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +16,8 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PI = process.env.PI_BIN || "pi";
 const MODEL = "gpt-5.6-luna";
+// The older tests switch the scheduled refresh off so their backend call counts stay exact.
+const QUIET = { PI_CODEX_ACCOUNTS_REFRESH_MS: "0" };
 
 const jwt = (account, email) =>
 	`h.${Buffer.from(
@@ -141,16 +144,17 @@ async function piHome(t, accounts = ["a1", "a2"]) {
 	});
 	await writeFile(join(dir, "auth.json"), JSON.stringify(auth), { mode: 0o600 });
 	await writeFile(join(dir, "settings.json"), JSON.stringify({ quietStartup: true }));
-	t.after(() => rm(dir, { recursive: true, force: true }));
+	// A pi that was just stopped may still be writing its last files.
+	t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 	return dir;
 }
-function runPi(home, base, prompt = "hi") {
+function runPi(home, base, prompt = "hi", extraEnv = {}) {
 	return new Promise((resolve) => {
 		const child = execFile(
 			PI,
 			["-p", "--no-session", "--no-context-files", "--no-skills", "--provider", "codex-pool", "--model", MODEL, prompt],
 			{
-				env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, PI_OFFLINE: "1" },
+				env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, ...QUIET, ...extraEnv, PI_OFFLINE: "1" },
 				timeout: 60_000,
 			},
 			(error, stdout, stderr) => resolve({ code: error ? (error.code ?? 1) : 0, stdout, stderr, out: stdout + stderr }),
@@ -278,7 +282,7 @@ test("a model missing from one account's plan is served by another account", asy
 		const child = execFile(
 			PI,
 			["-p", "--no-session", "--no-context-files", "--no-skills", "--provider", "codex-pool", "--model", "gpt-6.1-sol", "hi"],
-			{ env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: b.base, PI_OFFLINE: "1" } },
+			{ env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: b.base, ...QUIET, PI_OFFLINE: "1" } },
 			(error, stdout, stderr) => resolve({ stdout, out: stdout + stderr }),
 		);
 		child.stdin.end();
@@ -295,7 +299,7 @@ test("a model missing from one account's plan is served by another account", asy
 function runCommand(home, base, command, answer = () => ({ cancelled: true })) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(PI, ["--mode", "rpc", "--no-session", "--no-context-files", "--no-skills", "--provider", "codex-pool", "--model", MODEL], {
-			env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, PI_OFFLINE: "1" },
+			env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, ...QUIET, PI_OFFLINE: "1" },
 		});
 		const dialogs = [];
 		const notes = [];
@@ -320,8 +324,8 @@ function runCommand(home, base, command, answer = () => ({ cancelled: true })) {
 				// The command has run; give its notification a moment, then stop.
 				setTimeout(() => {
 					clearTimeout(timer);
+					child.once("exit", () => resolve({ dialogs, notes, text: notes.join("\n") }));
 					child.kill();
-					resolve({ dialogs, notes, text: notes.join("\n") });
 				}, 300);
 			}
 		});
@@ -426,7 +430,7 @@ function runSubagent(home, base, args, input) {
 		const child = execFile(
 			process.execPath,
 			[SUBAGENT, ...args],
-			{ env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, PI_OFFLINE: "1", PI_SUBAGENT_BIN: PI }, timeout: 60_000 },
+			{ env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, ...QUIET, PI_OFFLINE: "1", PI_SUBAGENT_BIN: PI }, timeout: 60_000 },
 			(error, stdout, stderr) => resolve({ code: error ? (error.code ?? 1) : 0, stdout, stderr }),
 		);
 		child.stdin.end(input ?? "");
@@ -456,4 +460,253 @@ test("codex-subagent rejects bad options before starting pi", async (t) => {
 	assert.equal(r.code, 2);
 	assert.match(r.stderr, /effort must be one of/);
 	assert.ok(!b.calls.length);
+});
+
+// ---- Shared state, shared refresh, check before refusing ---------------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const okSlow = (text, ms) => async (res) => {
+	await sleep(ms);
+	ok(text)(res);
+};
+const usageCalls = (calls) => calls.filter((c) => c.path === "/wham/usage").map((c) => c.account);
+const readJson = async (path) => JSON.parse(await readFile(path, "utf8"));
+const leaseFile = (home) => join(home, "codex-accounts.lease");
+const writeState = (home, accounts, extra = {}) =>
+	writeFile(join(home, "codex-accounts.json"), JSON.stringify({ slots: 5, cutoffPercent: 1, accounts, ...extra }), { mode: 0o600 });
+const blocked = (until, extra = {}) => ({
+	blockedUntil: until,
+	pausedUntil: 0,
+	reason: "usage limit reached",
+	windows: {},
+	credits: null,
+	email: null,
+	plan: null,
+	lastUsedAt: null,
+	deniedModels: {},
+	checkedAt: null,
+	notifiedReady: false,
+	banked: null,
+	...extra,
+});
+const room = { plan_type: "pro", rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 4, reset_at: Math.floor(Date.now() / 1000) + 18000, limit_window_seconds: 18000 } } };
+const full = (resetAt) => ({ plan_type: "pro", rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 100, reset_at: resetAt, limit_window_seconds: 18000 } } });
+
+// A long-lived pi (RPC mode) that answers several commands, like an open agent.
+function rpcSession(home, base, env = {}) {
+	const child = spawn(PI, ["--mode", "rpc", "--no-session", "--no-context-files", "--no-skills", "--provider", "codex-pool", "--model", MODEL], {
+		env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, ...QUIET, ...env, PI_OFFLINE: "1" },
+	});
+	let notes = [];
+	let waiting;
+	createInterface({ input: child.stdout }).on("line", (line) => {
+		let msg;
+		try {
+			msg = JSON.parse(line);
+		} catch {
+			return;
+		}
+		if (msg.type === "extension_ui_request" && msg.method === "notify") notes.push(msg.message);
+		if (msg.type === "response" && msg.command === "prompt") waiting?.();
+	});
+	let n = 0;
+	return {
+		child,
+		async run(command) {
+			notes = [];
+			const done = new Promise((r) => (waiting = r));
+			child.stdin.write(JSON.stringify({ id: `c${++n}`, type: "prompt", message: command }) + "\n");
+			await done;
+			await sleep(300);
+			return notes.join("\n");
+		},
+		close() {
+			if (child.exitCode !== null || child.signalCode) return Promise.resolve();
+			const gone = once(child, "exit");
+			child.kill();
+			return gone;
+		},
+	};
+}
+
+test("a running pi picks up another process's newer account state instead of using its stale copy", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const p1 = rpcSession(home, b.base);
+	t.after(() => p1.close());
+	// p1 has read the state once and now holds its own copy.
+	assert.match(await p1.run("/codex-accounts"), /codex-1 .*— ready/);
+	// Another pi process finds codex-1 at its limit and records it (and a setting the file did not know of).
+	const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+	const file = join(home, "codex-accounts.json");
+	await writeFile(file, JSON.stringify({ ...(await readJson(file)), futureField: { keep: true } }));
+	b.plans.a1 = [limit(resetsAt)];
+	b.plans.a2 = [ok("from-a2")];
+	assert.match((await runPi(home, b.base)).stdout, /from-a2/);
+	// p1 sees it without being restarted.
+	assert.match(await p1.run("/codex-accounts"), /codex-1 .*— paused until/);
+	// p1's later writes keep the other process's record and the fields it does not know.
+	await p1.run("/codex-accounts cutoff 2");
+	const s = await readJson(file);
+	assert.equal(s.accounts["codex-1"].blockedUntil, resetsAt * 1000);
+	assert.equal(s.cutoffPercent, 2);
+	assert.deepEqual(s.futureField, { keep: true });
+	assert.ok(s.accounts["codex-1"].updatedAt > 0);
+});
+
+test("two pi processes writing at once keep each other's updates", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+	// Both requests reach codex-1 before either reply is processed: one learns the account is
+	// at its limit, the other that its plan lacks the model. Both facts belong to codex-1.
+	let arrivals = 0;
+	let release;
+	const gate = new Promise((r) => (release = r));
+	b.plans.a1 = [
+		async (res) => {
+			const mine = ++arrivals;
+			if (arrivals >= 2) release();
+			await gate;
+			if (mine === 1) return limit(resetsAt)(res);
+			res.writeHead(400, { "content-type": "application/json" });
+			res.end(JSON.stringify({ detail: "The model is not supported when using Codex with a ChatGPT account." }));
+		},
+	];
+	b.plans.a2 = [ok("served")];
+	const [x, y] = await Promise.all([runPi(home, b.base), runPi(home, b.base)]);
+	assert.match(x.stdout, /served/, x.out);
+	assert.match(y.stdout, /served/, y.out);
+	const s = (await state(home)).accounts["codex-1"];
+	assert.equal(s.blockedUntil, resetsAt * 1000);
+	assert.ok(s.deniedModels[MODEL] > Date.now());
+	assert.ok((await state(home)).accounts["codex-2"].lastUsedAt > 0);
+	assert.ok(!existsSync(join(home, "codex-accounts.json.lock")));
+});
+
+test("a lease held by a dead process is taken over and usage is read once", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const dead = spawn(process.execPath, ["-e", "0"]);
+	await once(dead, "exit");
+	await writeFile(leaseFile(home), JSON.stringify({ pid: dead.pid, expiresAt: Date.now() + 600_000, lastRefreshAt: 0, claimPid: 0, claimUntil: 0 }));
+	b.plans.a1 = [okSlow("served", 1200)];
+	const r = await runPi(home, b.base, "hi", { PI_CODEX_ACCOUNTS_REFRESH_MS: "300000" });
+	assert.match(r.stdout, /served/, r.out);
+	assert.deepEqual(usageCalls(b.calls).sort(), ["a1", "a2"]);
+	assert.deepEqual(responses(b.calls), ["a1"]);
+	const lease = await readJson(leaseFile(home));
+	assert.equal(lease.pid, 0, "the lease is given back when the process ends");
+	assert.ok(Date.now() - lease.lastRefreshAt < 30_000);
+	assert.equal(lease.claimPid, 0);
+	const s = await state(home);
+	assert.ok(s.accounts["codex-1"].checkedAt > 0 && s.accounts["codex-2"].checkedAt > 0);
+});
+
+test("a live holder keeps the lease: other processes do not read usage, and take over when it is gone", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const holder = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"]);
+	t.after(() => holder.kill());
+	await writeFile(leaseFile(home), JSON.stringify({ pid: holder.pid, expiresAt: Date.now() + 600_000, lastRefreshAt: 0, claimPid: 0, claimUntil: 0 }));
+	b.plans.a1 = [okSlow("served", 1000)];
+	const env = { PI_CODEX_ACCOUNTS_REFRESH_MS: "300000" };
+	assert.match((await runPi(home, b.base, "hi", env)).stdout, /served/);
+	assert.deepEqual(usageCalls(b.calls), []);
+	assert.equal((await readJson(leaseFile(home))).pid, holder.pid);
+	// The holder goes away: the next process takes over.
+	holder.kill();
+	await once(holder, "exit");
+	assert.match((await runPi(home, b.base, "hi", env)).stdout, /served/);
+	assert.deepEqual(usageCalls(b.calls).sort(), ["a1", "a2"]);
+});
+
+test("an expired lease is taken over even if its holder still runs; a recent refresh is not repeated", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const idle = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"]);
+	t.after(() => idle.kill());
+	await writeFile(leaseFile(home), JSON.stringify({ pid: idle.pid, expiresAt: Date.now() - 1000, lastRefreshAt: 0, claimPid: 0, claimUntil: 0 }));
+	b.plans.a1 = [okSlow("served", 1000)];
+	const env = { PI_CODEX_ACCOUNTS_REFRESH_MS: "300000" };
+	await runPi(home, b.base, "hi", env);
+	assert.deepEqual(usageCalls(b.calls).sort(), ["a1", "a2"]);
+	// Usage was read a moment ago, so the next process leaves it alone.
+	await runPi(home, b.base, "hi", env);
+	assert.equal(usageCalls(b.calls).length, 2);
+});
+
+test("with four agents open there is one refresh per interval, not one per agent", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	b.usage.a1 = room;
+	b.usage.a2 = room;
+	const env = { PI_CODEX_ACCOUNTS_REFRESH_MS: "1500", PI_CODEX_ACCOUNTS_TICK_MS: "200" };
+	const agents = [0, 1, 2, 3].map(() => rpcSession(home, b.base, env));
+	t.after(() => agents.forEach((a) => a.close()));
+	await sleep(6500);
+	const perAccount = { a1: 0, a2: 0 };
+	for (const account of usageCalls(b.calls)) perAccount[account]++;
+	// Roughly one per 1.5 s per account: 3 to 5 in this window. One per agent would be 12 or more.
+	for (const [account, n] of Object.entries(perAccount)) assert.ok(n >= 2 && n <= 6, `${account} was read ${n} times`);
+	assert.equal(perAccount.a1, perAccount.a2);
+	// The others pick the readings up from the shared file.
+	const s = await state(home);
+	assert.equal(s.accounts["codex-1"].windows.primary.usedPercent, 4);
+	await Promise.all(agents.map((a) => a.close()));
+	assert.equal((await readJson(leaseFile(home))).pid, 0);
+});
+
+test("usage that shows room is used again whatever the stored block says; one refresh before refusing", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	// Both accounts were blocked an hour ago for another three; OpenAI has since reset codex-1.
+	const until = Date.now() + 3 * 3600_000;
+	await writeState(home, {
+		"codex-1": blocked(until, { blockedAt: Date.now() - 3600_000 }),
+		"codex-2": blocked(until, { blockedAt: Date.now() - 3600_000 }),
+	});
+	const resetAt = Math.floor(Date.now() / 1000) + 3 * 3600;
+	b.usage.a1 = room;
+	b.usage.a2 = full(resetAt);
+	b.plans.a1 = [ok("a1-after-early-reset")];
+	b.plans.a2 = [ok("must-not-run")];
+	const r = await runPi(home, b.base);
+	assert.match(r.stdout, /a1-after-early-reset/, r.out);
+	assert.deepEqual(responses(b.calls), ["a1"]);
+	assert.deepEqual(usageCalls(b.calls).sort(), ["a1", "a2"]);
+	const s = await state(home);
+	assert.equal(s.accounts["codex-1"].blockedUntil, 0);
+	assert.equal(s.accounts["codex-2"].blockedUntil, resetAt * 1000);
+});
+
+test("when usage confirms every account is at its limit, the same message is given and usage is read once a minute", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const resetAt = Math.floor(Date.now() / 1000) + 3600;
+	await writeState(home, {
+		"codex-1": blocked(resetAt * 1000 + 7200_000, { blockedAt: Date.now() - 600_000 }),
+		"codex-2": blocked(resetAt * 1000, { blockedAt: Date.now() - 600_000 }),
+	});
+	b.usage.a1 = full(resetAt + 7200);
+	b.usage.a2 = full(resetAt);
+	for (let i = 0; i < 2; i++) {
+		const r = await runPi(home, b.base);
+		assert.notEqual(r.code, 0);
+		assert.match(r.out, /All Codex accounts are at their limit\. codex-2 \(a2@example\.com\) resets at/, r.out);
+	}
+	assert.deepEqual(responses(b.calls), []);
+	assert.deepEqual(usageCalls(b.calls).sort(), ["a1", "a2"], "the second refusal reuses the reading from a few seconds before");
+});
+
+test("a limit error that just came in is not undone by a usage reading that says there is room", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+	b.plans.a1 = [limit(resetsAt)];
+	b.plans.a2 = [limit(resetsAt + 60)];
+	b.usage.a1 = room; // lags behind the error
+	b.usage.a2 = room;
+	const r = await runPi(home, b.base);
+	assert.match(r.out, /All Codex accounts are at their limit\. codex-1 \(a1@example\.com\) resets at/, r.out);
 });
