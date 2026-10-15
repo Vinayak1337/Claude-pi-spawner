@@ -104,7 +104,6 @@ It runs this as a background Bash job, so each subagent shows in the task list a
 | `/codex-accounts refresh` | Reads usage from ChatGPT now |
 | `/codex-accounts resets` | Banked resets per account, with expiry dates |
 | `/codex-accounts reset codex-N` | Shows what would be spent; add `confirm` to spend it |
-| `/codex-accounts cutoff <percent>` | Switch accounts at this % remaining (default 1) |
 | `/codex-accounts slots <n>` | Number of account slots (1–20) |
 
 The same `/codex-accounts …` commands work inside pi, where `reset` asks in a dialog. Efforts are `off`, `minimal`, `low`, `medium`, `high` and `xhigh`.
@@ -131,7 +130,7 @@ Or pick a `codex-pool/…` model with `/model`.
 | Path | Contents |
 |---|---|
 | `~/.pi/agent/auth.json` | pi's sign-ins, including `codex-1…N` (managed by pi) |
-| `~/.pi/agent/codex-accounts.json` | Pool state: usage, reset times, banked resets, cutoff, slots |
+| `~/.pi/agent/codex-accounts.json` | Pool state: usage, reset times, banked resets, slots |
 | `~/.pi/agent/claude-subagents/` | Subagent sessions, plus `defaults.json` (saved model and effort) |
 
 These are local files that don't depend on the Claude account you're signed in with, so they stay when you switch Claude accounts.

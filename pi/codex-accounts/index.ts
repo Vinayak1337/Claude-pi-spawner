@@ -48,7 +48,6 @@ import { dirname, join } from "node:path";
 
 const POOL = "codex-pool";
 const DEFAULT_SLOTS = 5;
-const DEFAULT_CUTOFF_PERCENT = 1;
 const ATTEMPTS_PER_ACCOUNT = 3;
 const UNKNOWN_RESET_MS = 5 * 60_000;
 const AUTH_PAUSE_MS = 60_000;
@@ -103,7 +102,6 @@ type AccountState = {
 type Banked = { id: string; title: string | null; expiresAt: number | null; supported: boolean };
 type Store = {
 	slots: number;
-	cutoffPercent: number;
 	extraModels: string[];
 	accounts: Record<string, AccountState>;
 };
@@ -142,10 +140,6 @@ const sleepSync = (ms: number) => {
 function normalize(data: any): Store {
 	return {
 		slots: Number.isInteger(data?.slots) && data.slots > 0 && data.slots <= 20 ? data.slots : DEFAULT_SLOTS,
-		cutoffPercent:
-			Number.isFinite(data?.cutoffPercent) && data.cutoffPercent >= 0 && data.cutoffPercent < 100
-				? data.cutoffPercent
-				: DEFAULT_CUTOFF_PERCENT,
 		extraModels: Array.isArray(data?.extraModels)
 			? data.extraModels.filter((m: unknown) => typeof m === "string")
 			: DEFAULT_EXTRA_MODELS,
@@ -164,7 +158,7 @@ function readDisk(): { raw: any; store: Store } | null {
 }
 const disk0 = readDisk();
 const store: Store = disk0?.store ?? normalize(null);
-const settingsOf = (s: Store) => ({ slots: s.slots, cutoffPercent: s.cutoffPercent, extraModels: s.extraModels });
+const settingsOf = (s: Store) => ({ slots: s.slots, extraModels: s.extraModels });
 // What this process last saw on disk, per account and for the settings. A record that
 // differs from it is a change this process still has to write.
 let baseSettings = clone(settingsOf(store));
@@ -250,7 +244,6 @@ function replaceInPlace(target: any, source: any) {
 function reconcile(disk: Store) {
 	const merged = mergeFields(settingsOf(store), baseSettings, settingsOf(disk), false);
 	store.slots = merged.slots;
-	store.cutoffPercent = merged.cutoffPercent;
 	store.extraModels = merged.extraModels;
 	baseSettings = clone(settingsOf(disk));
 	for (const [id, theirs] of Object.entries(disk.accounts)) {
@@ -388,16 +381,14 @@ function block(id: string, until: number, reason: string) {
 	a.notifiedReady = false;
 	save();
 }
-function atCutoff(a: AccountState, t = now()) {
-	return Object.values(a.windows).some(
-		(w) => w && w.resetAt && w.resetAt * 1000 > t && w.usedPercent >= 100 - store.cutoffPercent,
-	);
+function atLimit(a: AccountState, t = now()) {
+	return Object.values(a.windows).some((w) => w && w.resetAt && w.resetAt * 1000 > t && w.usedPercent >= 100);
 }
 // The earliest time a currently limited account could serve again.
 function readyAt(a: AccountState, t = now()) {
 	const times = [a.blockedUntil, a.pausedUntil].filter((x) => x > t);
 	for (const w of Object.values(a.windows))
-		if (w && w.resetAt && w.resetAt * 1000 > t && w.usedPercent >= 100 - store.cutoffPercent)
+		if (w && w.resetAt && w.resetAt * 1000 > t && w.usedPercent >= 100)
 			times.push(w.resetAt * 1000);
 	return times.length ? Math.max(...times) : t;
 }
@@ -528,7 +519,7 @@ async function candidates(exclude: Set<string>, modelId: string, signal?: AbortS
 		const a = account(id);
 		const t = now();
 		if ((a.deniedModels ??= {})[modelId] > t) continue;
-		if (a.pausedUntil > t || a.blockedUntil > t || atCutoff(a, t)) continue;
+		if (a.pausedUntil > t || a.blockedUntil > t || atLimit(a, t)) continue;
 		const key = await token(id);
 		if (!key) continue;
 		describeToken(id, key);
@@ -537,7 +528,7 @@ async function candidates(exclude: Set<string>, modelId: string, signal?: AbortS
 			try {
 				await readUsage(id, key, signal);
 			} catch {}
-			if (a.blockedUntil > now() || atCutoff(a)) continue;
+			if (a.blockedUntil > now() || atLimit(a)) continue;
 		}
 		if (!a.notifiedReady) {
 			a.notifiedReady = true;
@@ -1093,7 +1084,7 @@ async function spendBanked(slot: string | undefined, ctx: ExtensionContext, flag
 	const a = account(slot);
 	const credit = (await readBanked(slot, key)).find((b) => b.supported);
 	if (!credit) return `${label(slot)} has no banked reset it can spend.`;
-	const limited = a.blockedUntil > now() || atCutoff(a) || Object.values(a.windows).some((w) => w && w.usedPercent >= 100);
+	const limited = a.blockedUntil > now() || atLimit(a) || Object.values(a.windows).some((w) => w && w.usedPercent >= 100);
 	const title = `Spend a banked reset on ${label(slot)}?`;
 	const details = [
 		`${credit.title || "Reset"}${credit.expiresAt ? `, expires ${fmtTime(credit.expiresAt)}` : ""}.`,
@@ -1207,7 +1198,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("codex-accounts", {
-		description: "Codex pool: show accounts; `refresh`, `resets`, `reset [codex-N]`, `cutoff <percent>`, `slots <n>`",
+		description: "Codex pool: show accounts; `refresh`, `resets`, `reset [codex-N]`, `slots <n>`",
 		handler: async (args, ctx) => {
 			registry = ctx.modelRegistry;
 			// Without a UI (pi -p), answers are printed (pi routes them to stderr) for scripts and Claude.
@@ -1215,14 +1206,6 @@ export default function (pi: ExtensionAPI) {
 			const words = (args || "").trim().split(/\s+/);
 			const flags = new Set(words.filter((w) => w.startsWith("--")));
 			const [cmd, value] = words.filter((w) => !w.startsWith("--"));
-			if (cmd === "cutoff" && value !== undefined) {
-				const n = Number(value);
-				if (!Number.isFinite(n) || n < 0 || n >= 100) return ui.notify("Use a percent from 0 to 99.", "error");
-				sync();
-				store.cutoffPercent = n;
-				save();
-				return ui.notify(`Accounts switch at ${n}% remaining.`, "info");
-			}
 			if (cmd === "slots" && value !== undefined) {
 				const n = Number(value);
 				if (!Number.isInteger(n) || n < 1 || n > 20) return ui.notify("Use 1 to 20 slots.", "error");

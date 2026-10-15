@@ -74,7 +74,7 @@ Environment variables the extension reads: `PI_CODING_AGENT_DIR` (pi's folder) a
 
 [test.mjs](../pi/codex-accounts/test.mjs) starts a fake ChatGPT backend and a throwaway `PI_CODING_AGENT_DIR`, then drives the real `pi` binary.
 
-- [L165-L267](../pi/codex-accounts/test.mjs#L165): pausing until the exact reset, recovery with a usage check, a window still exhausted after another resets, the 1% cutoff, retries, the all-limited message, non-account errors, and a model missing from one plan.
+- [L165-L267](../pi/codex-accounts/test.mjs#L165): pausing until the exact reset, recovery with a usage check, a window still exhausted after another resets, an account at 99% kept until its limit, retries, the all-limited message, non-account errors, and a model missing from one plan.
 - [L332-L411](../pi/codex-accounts/test.mjs#L332): showing, listing and spending banked resets (dialogs over RPC), `--dry-run`/`--yes`, and print mode.
 - [L436-L452](../pi/codex-accounts/test.mjs#L436): the `codex-subagent` command, covering saved defaults, the account footer, and rejecting bad options.
 

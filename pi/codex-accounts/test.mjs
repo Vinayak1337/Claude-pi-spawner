@@ -221,21 +221,20 @@ test("a reset that leaves another window exhausted keeps the account paused unti
 	assert.deepEqual(responses(b.calls), ["a1", "a2", "a2"]);
 });
 
-test("usage headers switch accounts at the 1% cutoff before a limit error", async (t) => {
+test("an account at 99% usage keeps serving until it hits its limit", async (t) => {
 	const b = await backend(t);
 	const home = await piHome(t);
 	const reset = Math.floor(Date.now() / 1000) + 3600;
-	b.plans.a1 = [
-		ok("a1-last", {
-			"x-codex-primary-used-percent": "99.5",
-			"x-codex-primary-reset-at": String(reset),
-			"x-codex-primary-window-minutes": "300",
-		}),
-	];
-	b.plans.a2 = [ok("a2-next")];
-	assert.match((await runPi(home, b.base)).stdout, /a1-last/);
-	assert.match((await runPi(home, b.base)).stdout, /a2-next/);
-	assert.deepEqual(responses(b.calls), ["a1", "a2"]);
+	const nearly = {
+		"x-codex-primary-used-percent": "99.5",
+		"x-codex-primary-reset-at": String(reset),
+		"x-codex-primary-window-minutes": "300",
+	};
+	b.plans.a1 = [ok("a1-first", nearly), ok("a1-again", nearly)];
+	b.plans.a2 = [ok("a2-unused")];
+	assert.match((await runPi(home, b.base)).stdout, /a1-first/);
+	assert.match((await runPi(home, b.base)).stdout, /a1-again/);
+	assert.deepEqual(responses(b.calls), ["a1", "a1"]);
 });
 
 test("brief upstream failures are retried on the same account", async (t) => {
@@ -473,7 +472,7 @@ const usageCalls = (calls) => calls.filter((c) => c.path === "/wham/usage").map(
 const readJson = async (path) => JSON.parse(await readFile(path, "utf8"));
 const leaseFile = (home) => join(home, "codex-accounts.lease");
 const writeState = (home, accounts, extra = {}) =>
-	writeFile(join(home, "codex-accounts.json"), JSON.stringify({ slots: 5, cutoffPercent: 1, accounts, ...extra }), { mode: 0o600 });
+	writeFile(join(home, "codex-accounts.json"), JSON.stringify({ slots: 5, accounts, ...extra }), { mode: 0o600 });
 const blocked = (until, extra = {}) => ({
 	blockedUntil: until,
 	pausedUntil: 0,
@@ -546,10 +545,10 @@ test("a running pi picks up another process's newer account state instead of usi
 	// p1 sees it without being restarted.
 	assert.match(await p1.run("/codex-accounts"), /codex-1 .*— paused until/);
 	// p1's later writes keep the other process's record and the fields it does not know.
-	await p1.run("/codex-accounts cutoff 2");
+	await p1.run("/codex-accounts slots 6");
 	const s = await readJson(file);
 	assert.equal(s.accounts["codex-1"].blockedUntil, resetsAt * 1000);
-	assert.equal(s.cutoffPercent, 2);
+	assert.equal(s.slots, 6);
 	assert.deepEqual(s.futureField, { keep: true });
 	assert.ok(s.accounts["codex-1"].updatedAt > 0);
 });
