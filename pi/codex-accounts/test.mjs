@@ -16,8 +16,9 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PI = process.env.PI_BIN || "pi";
 const MODEL = "gpt-5.6-luna";
-// The older tests switch the scheduled refresh off so their backend call counts stay exact.
-const QUIET = { PI_CODEX_ACCOUNTS_REFRESH_MS: "0" };
+// The older tests switch the scheduled refresh off so their backend call counts stay exact,
+// and expect a refusal (not a wait) when every account is at its limit.
+const QUIET = { PI_CODEX_ACCOUNTS_REFRESH_MS: "0", PI_CODEX_ACCOUNTS_WAIT_MS: "0" };
 
 const jwt = (account, email) =>
 	`h.${Buffer.from(
@@ -253,6 +254,32 @@ test("when every account is limited the error names the earliest reset", async (
 	b.plans.a1 = [limit(soon + 7200)];
 	b.plans.a2 = [limit(soon)];
 	const r = await runPi(home, b.base);
+	assert.notEqual(r.code, 0);
+	assert.match(r.out, /All Codex accounts are at their limit\. codex-2 \(a2@example\.com\) resets at/);
+});
+
+test("when every account is limited, the request waits for the soonest reset and carries on", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const soon = Math.floor(Date.now() / 1000) + 2;
+	b.plans.a1 = [limit(soon + 7200)];
+	b.plans.a2 = [limit(soon), ok("a2-after-its-reset")];
+	b.usage.a2 = { plan_type: "pro", rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 1, reset_at: soon + 18000, limit_window_seconds: 18000 } } };
+	const started = Date.now();
+	const r = await runPi(home, b.base, "hi", { PI_CODEX_ACCOUNTS_WAIT_MS: "60000", PI_CODEX_ACCOUNTS_RESET_MARGIN_MS: "200" });
+	assert.equal(r.code, 0, r.out);
+	assert.match(r.stdout, /a2-after-its-reset/, r.out);
+	assert.ok(Date.now() - started >= 1500, "it waited for the reset");
+	assert.deepEqual(responses(b.calls), ["a1", "a2", "a2"]);
+});
+
+test("a reset further away than the wait limit is refused at once", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const soon = Math.floor(Date.now() / 1000) + 1800;
+	b.plans.a1 = [limit(soon + 7200)];
+	b.plans.a2 = [limit(soon)];
+	const r = await runPi(home, b.base, "hi", { PI_CODEX_ACCOUNTS_WAIT_MS: "60000" });
 	assert.notEqual(r.code, 0);
 	assert.match(r.out, /All Codex accounts are at their limit\. codex-2 \(a2@example\.com\) resets at/);
 });
@@ -708,4 +735,29 @@ test("a limit error that just came in is not undone by a usage reading that says
 	b.usage.a2 = room;
 	const r = await runPi(home, b.base);
 	assert.match(r.out, /All Codex accounts are at their limit\. codex-1 \(a1@example\.com\) resets at/, r.out);
+});
+
+test("a request waiting for a reset carries on as soon as a shared refresh shows an account free", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const resetAt = Math.floor(Date.now() / 1000) + 3600;
+	await writeState(home, {
+		"codex-1": blocked(resetAt * 1000 + 7200_000, { blockedAt: Date.now() - 600_000 }),
+		"codex-2": blocked(resetAt * 1000, { blockedAt: Date.now() - 600_000 }),
+	});
+	b.usage.a1 = full(resetAt + 7200);
+	b.usage.a2 = full(resetAt);
+	b.plans.a2 = [ok("a2-freed-early")];
+	const running = runPi(home, b.base, "hi", { PI_CODEX_ACCOUNTS_WAIT_MS: String(2 * 3600_000), PI_CODEX_ACCOUNTS_TICK_MS: "100" });
+	await new Promise((r) => setTimeout(r, 1500));
+	// Another process's refresh found that codex-2's limit was reset early (say, a banked reset).
+	b.usage.a2 = room;
+	await writeState(home, {
+		"codex-1": blocked(resetAt * 1000 + 7200_000, { blockedAt: Date.now() - 600_000 }),
+		"codex-2": blocked(0, { reason: null, notifiedReady: true, checkedAt: Date.now(), windows: { primary: { usedPercent: 4, resetAt: resetAt + 18000, windowMinutes: 300 } } }),
+	});
+	const r = await running;
+	assert.equal(r.code, 0, r.out);
+	assert.match(r.stdout, /a2-freed-early/, r.out);
+	assert.deepEqual(responses(b.calls), ["a2"]);
 });

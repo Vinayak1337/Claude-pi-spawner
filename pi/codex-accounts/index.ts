@@ -6,7 +6,9 @@
  * - The `codex-pool` provider serves every Codex model. Each request goes to the
  *   first ready account; an account that reaches its limit is paused until its
  *   exact reset time and the same request moves to the next account. Nothing is
- *   switched once output has started.
+ *   switched once output has started. When every account is at its limit, the
+ *   request waits for the soonest reset and carries on, instead of failing
+ *   (`PI_CODEX_ACCOUNTS_WAIT_MS`, default 6 hours; 0 refuses at once).
  * - Reset times come from response headers, the limit error and the usage
  *   endpoint. A paused account is checked and returned to rotation on its own.
  * - `/codex-accounts` shows each account and any banked resets; `/codex-accounts refresh`
@@ -21,10 +23,12 @@
  *   now) under a short lock file, so no process overwrites another's newer reading.
  * - While any process uses `codex-pool` (UI or `pi -p`), one of them, elected through
  *   `codex-accounts.lease` (holder pid + expiry), reads every account's usage every
- *   5 minutes. The others pick the result up from the shared file. A refresh only
+ *   minute (`PI_CODEX_ACCOUNTS_REFRESH_MS`). The others pick the result up from the shared file. A refresh only
  *   reads usage: no model request, no banked reset is spent.
  * - Before the pool reports that every account is at its limit, it reads usage once
- *   more (at most once a minute across all processes). An account whose real usage
+ *   more, but only if nobody read it in the last refresh interval (1 minute); a request
+ *   asking sooner is turned down and uses the shared reading. A request waiting for a
+ *   reset takes up each new shared reading, so it ends as soon as any account is free. An account whose real usage
  *   shows room is used again whatever its stored `blockedUntil` says.
  */
 import {
@@ -65,19 +69,25 @@ const envMs = (name: string, fallback: number) => {
 	const n = Number(process.env[name]);
 	return process.env[name] !== undefined && process.env[name] !== "" && Number.isFinite(n) && n >= 0 ? n : fallback;
 };
-const REFRESH_MS = envMs("PI_CODEX_ACCOUNTS_REFRESH_MS", 5 * 60_000);
+const REFRESH_MS = envMs("PI_CODEX_ACCOUNTS_REFRESH_MS", 60_000);
 // How often each process looks at the shared state and at the lease.
 const TICK_MS = Math.max(50, envMs("PI_CODEX_ACCOUNTS_TICK_MS", 30_000));
 const LEASE_MS = 3 * TICK_MS;
 // A refresh that has not finished by then is treated as abandoned.
 const CLAIM_MS = 60_000;
-// Before refusing with "all at their limit", usage is re-read at most this often.
-const REFUSE_REFRESH_MS = 60_000;
+// Before refusing with "all at their limit", usage is re-read at most this often: no more
+// often than the scheduled refresh, so many agents asking at once still read usage once.
+const REFUSE_REFRESH_MS = REFRESH_MS > 0 ? REFRESH_MS : 60_000;
 // A limit error this recent outranks a usage reading that says there is room.
 const FRESH_BLOCK_MS = 60_000;
 // Longest a scheduled or pre-refusal usage read may take, and the longest a request waits for one.
 const USAGE_TIMEOUT_MS = 8_000;
 const RECHECK_WAIT_MS = 12_000;
+// When every account is at its limit, a request waits for the soonest reset instead of failing,
+// as long as that reset is at most this far away (0 turns waiting off and refuses at once).
+const WAIT_FOR_RESET_MS = envMs("PI_CODEX_ACCOUNTS_WAIT_MS", 6 * 60 * 60_000);
+// Margin after a reported reset, so the first request after it is not refused again.
+const RESET_MARGIN_MS = envMs("PI_CODEX_ACCOUNTS_RESET_MARGIN_MS", 15_000);
 // Tests point the pool at a local server.
 const BASE_URL = process.env.PI_CODEX_ACCOUNTS_BASE_URL;
 
@@ -683,7 +693,7 @@ function runClaimedRefresh(signal?: AbortSignal) {
 	return refreshing;
 }
 // Before the pool says "all accounts are at their limit": read usage once more, but
-// at most once a minute across all processes, then take the shared state as it is.
+// at most once per refresh interval across all processes, then take the shared state as it is.
 async function recheckBeforeRefusing(signal?: AbortSignal) {
 	let giveUp: ReturnType<typeof setTimeout> | undefined;
 	const limit = new Promise<void>((resolve) => (giveUp = setTimeout(resolve, RECHECK_WAIT_MS)));
@@ -814,6 +824,43 @@ function errorMessage(model: Model<Api>, message: string): AssistantMessage {
 	};
 }
 
+// The signed-in account whose limit resets first, when every one of them is limited now.
+async function soonestReset(): Promise<{ id: string; at: number } | undefined> {
+	const t = now();
+	const times = (await signedInSlots()).map((id) => ({ id, at: readyAt(account(id), t) }));
+	if (!times.length || times.some((x) => x.at <= t)) return undefined;
+	return times.sort((a, b) => a.at - b.at)[0];
+}
+
+// Waits until [at] (plus a margin), waking every tick to take up the shared state: when the
+// scheduled refresh shows an account free sooner, the wait ends then. False when aborted.
+async function waitForReset(at: number, signal?: AbortSignal): Promise<boolean> {
+	for (;;) {
+		const left = at + RESET_MARGIN_MS - now();
+		if (left <= 0) return true;
+		if (!(await pause(Math.min(left, TICK_MS), signal))) return false;
+		sync();
+		const soonest = await soonestReset();
+		if (!soonest) return true;
+		at = Math.min(at, soonest.at);
+	}
+}
+
+// Sleeps [ms]; false when [signal] aborts first.
+function pause(ms: number, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return Promise.resolve(false);
+	return new Promise((resolve) => {
+		const done = (ok: boolean) => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolve(ok);
+		};
+		const onAbort = () => done(false);
+		const timer = setTimeout(() => done(true), Math.max(0, ms));
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 export function streamPool(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const out = createAssistantMessageEventStream();
 	(async () => {
@@ -833,7 +880,18 @@ export function streamPool(model: Model<Api>, context: Context, options?: Simple
 				await recheckBeforeRefusing(options?.signal);
 				[next] = await candidates(tried, model.id, options?.signal);
 			}
-			if (!next) break;
+			if (!next) {
+				const soonest = await soonestReset();
+				if (soonest && soonest.at - now() <= WAIT_FOR_RESET_MS) {
+					notify?.(`All Codex accounts are at their limit. Waiting for ${label(soonest.id)} at ${fmtTime(soonest.at)} (in ${fmtIn(soonest.at)}).`);
+					if (!(await waitForReset(soonest.at, options?.signal))) continue;
+					// A new window: every account may serve again, and usage is worth reading once more.
+					tried.clear();
+					rechecked = false;
+					continue;
+				}
+				break;
+			}
 			tried.add(next.id);
 			for (let attempt = 0; attempt < ATTEMPTS_PER_ACCOUNT; attempt++) {
 				const seen: { status?: number; body?: any; headers?: Headers } = {};
@@ -932,10 +990,7 @@ export function streamPool(model: Model<Api>, context: Context, options?: Simple
 		if (!accounts.length)
 			message = `No Codex accounts are signed in. Run /login codex-1 (and codex-2, … for more accounts).`;
 		else {
-			const soonest = accounts
-				.map((id) => ({ id, at: readyAt(account(id)) }))
-				.filter((x) => x.at > now())
-				.sort((a, b) => a.at - b.at)[0];
+			const soonest = await soonestReset();
 			message = soonest
 				? `All Codex accounts are at their limit. ${label(soonest.id)} resets at ${fmtTime(soonest.at)} (in ${fmtIn(soonest.at)}).`
 				: `No Codex account could serve this request${lastError ? `: ${lastError}` : "."}`;
