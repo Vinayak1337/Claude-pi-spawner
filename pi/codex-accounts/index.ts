@@ -120,6 +120,9 @@ const agentDir = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi",
 const storePath = () => join(agentDir(), "codex-accounts.json");
 const lockPath = () => `${storePath()}.lock`;
 const leasePath = () => join(agentDir(), "codex-accounts.lease");
+// While a request waits for a reset, this file names the moment it waits for, so a caller that
+// limits the run's time (codex-subagent) can leave the waiting out of it.
+const waitingPath = () => join(agentDir(), "codex-waiting", String(process.pid));
 const now = () => Date.now();
 const clone = <T>(x: T): T => JSON.parse(JSON.stringify(x));
 // Key-order independent text of a value, for comparing records.
@@ -835,6 +838,19 @@ async function soonestReset(): Promise<{ id: string; at: number } | undefined> {
 // Waits until [at] (plus a margin), waking every tick to take up the shared state: when the
 // scheduled refresh shows an account free sooner, the wait ends then. False when aborted.
 async function waitForReset(at: number, signal?: AbortSignal): Promise<boolean> {
+	try {
+		mkdirSync(dirname(waitingPath()), { recursive: true });
+		writeFileSync(waitingPath(), String(at));
+	} catch {}
+	try {
+		return await waitUntil(at, signal);
+	} finally {
+		try {
+			rmSync(waitingPath(), { force: true });
+		} catch {}
+	}
+}
+async function waitUntil(at: number, signal?: AbortSignal): Promise<boolean> {
 	for (;;) {
 		const left = at + RESET_MARGIN_MS - now();
 		if (left <= 0) return true;

@@ -7,7 +7,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { execFile, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, symlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -451,12 +451,12 @@ test("without a UI (pi -p) the commands print their answer", async (t) => {
 
 // Claude's background command for subagents (claude/pi-subagents/bin).
 const SUBAGENT = new URL("../../claude/pi-subagents/bin/codex-subagent.mjs", import.meta.url).pathname;
-function runSubagent(home, base, args, input) {
+function runSubagent(home, base, args, input, env = {}) {
 	return new Promise((resolve) => {
 		const child = execFile(
 			process.execPath,
 			[SUBAGENT, ...args],
-			{ env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, ...QUIET, PI_OFFLINE: "1", PI_SUBAGENT_BIN: PI }, timeout: 60_000 },
+			{ env: { ...process.env, PI_CODING_AGENT_DIR: home, PI_CODEX_ACCOUNTS_BASE_URL: base, ...QUIET, ...env, PI_OFFLINE: "1", PI_SUBAGENT_BIN: PI }, timeout: 60_000 },
 			(error, stdout, stderr) => resolve({ code: error ? (error.code ?? 1) : 0, stdout, stderr }),
 		);
 		child.stdin.end(input ?? "");
@@ -477,6 +477,26 @@ test("codex-subagent runs a task on the pool with the saved defaults and names t
 	b.plans.a2 = [ok("from-a2")];
 	const r2 = await runSubagent(home, b.base, ["--effort", "low", "--access", "edit", "say", "hi"]);
 	assert.match(r2.stdout, /from-a2[\s\S]*· low · edit · account codex-2/, r2.stdout);
+});
+
+test("codex-subagent does not count time spent waiting for a reset against its timeout", async (t) => {
+	const b = await backend(t);
+	const home = await piHome(t);
+	const soon = Math.floor(Date.now() / 1000) + 5;
+	b.plans.a1 = [limit(soon + 7200)];
+	b.plans.a2 = [limit(soon), ok("after-the-wait")];
+	b.usage.a2 = room;
+	const started = Date.now();
+	// A 3-second timeout, and a 5-second wait for codex-2's reset.
+	const r = await runSubagent(home, b.base, ["--timeout", "0.05", "say", "hi"], undefined, {
+		PI_CODEX_ACCOUNTS_WAIT_MS: "60000",
+		PI_CODEX_ACCOUNTS_RESET_MARGIN_MS: "200",
+		PI_CODEX_ACCOUNTS_TICK_MS: "200",
+	});
+	assert.equal(r.code, 0, r.stdout + r.stderr);
+	assert.match(r.stdout, /after-the-wait/, r.stdout);
+	assert.ok(Date.now() - started >= 4000, "it waited for the reset");
+	assert.ok(!existsSync(join(home, "codex-waiting", "x")) && (await readdir(join(home, "codex-waiting"))).length === 0, "the waiting marker is removed");
 });
 
 test("codex-subagent rejects bad options before starting pi", async (t) => {

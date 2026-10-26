@@ -32,7 +32,8 @@ The task comes from --task-file, the remaining arguments, or stdin.
   --access A         read-only (default) or edit (bash, edit, write; no sandbox)
   --cwd DIR          folder the subagent works in (default: current folder)
   --session ID       continue an earlier subagent (its id is printed at the end)
-  --timeout MIN      stop after MIN minutes (default 30, max 240)
+  --timeout MIN      stop after MIN minutes of work (default 30, max 240); time spent
+                     waiting for an account's limit to reset is not counted
   --task-file FILE   read the task from FILE
 
 Saved defaults: /codex-subagent in Claude Code (${join(agentDir, "claude-subagents", "defaults.json")}).
@@ -114,17 +115,30 @@ const stop = (why) => {
 	child.kill("SIGTERM");
 	setTimeout(() => child.kill("SIGKILL"), 5000).unref();
 };
-const timer = setTimeout(() => stop("timeout"), timeoutMs);
+// The timeout counts working time only: while the pool waits for an account's limit to reset
+// (it leaves a marker named after the pi process), the clock is paused.
+const waitingMarker = join(agentDir, "codex-waiting", String(child.pid));
+let worked = 0;
+let lastTick = Date.now();
+let waitedMs = 0;
+const timer = setInterval(() => {
+	const t = Date.now();
+	if (existsSync(waitingMarker)) waitedMs += t - lastTick;
+	else worked += t - lastTick;
+	lastTick = t;
+	if (worked >= timeoutMs) stop("timeout");
+}, Math.min(1000, timeoutMs));
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => stop("stopped"));
 
 child.on("close", (code) => {
-	clearTimeout(timer);
+	clearInterval(timer);
 	const after = readState();
 	const served = Object.entries(after.accounts ?? {})
 		.filter(([id, a]) => (a.lastUsedAt ?? 0) > (before.accounts?.[id]?.lastUsedAt ?? 0))
 		.map(([id, a]) => (a.email ? `${id} (${a.email})` : id));
 	const minutes = ((Date.now() - started) / 60_000).toFixed(1);
-	const footer = `[pi subagent · ${model} · ${effort} · ${opts.access} · ${served.length ? `account ${served.join(", ")}` : "account unknown"} · ${minutes} min · session ${session}]`;
+	const waited = waitedMs >= 60_000 ? ` (${(waitedMs / 60_000).toFixed(1)} waiting for a reset)` : "";
+	const footer = `[pi subagent · ${model} · ${effort} · ${opts.access} · ${served.length ? `account ${served.join(", ")}` : "account unknown"} · ${minutes} min${waited} · session ${session}]`;
 	const answer = stdout.trim();
 	if (stopped) {
 		process.stdout.write(`${answer || "(no answer yet)"}\n\n${stopped === "timeout" ? `Stopped after ${minutes} minutes (timeout).` : "Stopped."}\n${footer}\n`);
